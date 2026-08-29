@@ -11,126 +11,108 @@ if (!supabaseUrl || !supabaseServiceRoleKey) {
 }
 
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
-const server = new McpServer({
-  name: "rolecamp-course-mcp",
-  version: "0.1.0",
-});
+const server = new McpServer({ name: "rolecamp-course-mcp", version: "0.1.0" });
 
 server.registerTool(
   "get_course_structure",
   {
-    description:
-      "Get a RoleCamp course and its Module -> Chapter -> Content hierarchy by course slug.",
+    description: "Get a RoleCamp course as Course -> Module -> Chapter -> Content.",
     inputSchema: {
-      course_slug: z.string().min(1).describe("Course slug, for example forward-deployed-product-manager"),
+      course_slug: z.string().min(1).describe("Course slug"),
     },
   },
   async ({ course_slug }) => {
     const { data: course, error: courseError } = await supabase
       .from("course")
-      .select("slug,title,status,source")
+      .select("slug,title,subtitle,description,status,difficulty,weeks,sessions")
       .eq("slug", course_slug)
       .maybeSingle();
 
-    if (courseError) {
-      throw new Error(`Failed to load course: ${courseError.message}`);
-    }
+    if (courseError) throw new Error(`Failed to load course: ${courseError.message}`);
     if (!course) {
       return {
-        content: [{ type: "text", text: JSON.stringify({ error: "Course not found", course_slug }) }],
         isError: true,
+        content: [{ type: "text", text: JSON.stringify({ error: "Course not found", course_slug }) }],
       };
     }
 
-    const { data: modules, error: modulesError } = await supabase
-      .from("course_section")
-      .select("id,title,blurb,sort_order")
+    // Conceptual Module = live `chapter` row.
+    const { data: modules, error: moduleError } = await supabase
+      .from("chapter")
+      .select("id,title,week,outcome,sort_order")
       .eq("course_slug", course_slug)
       .order("sort_order", { ascending: true });
 
-    if (modulesError) {
-      throw new Error(`Failed to load modules: ${modulesError.message}`);
-    }
+    if (moduleError) throw new Error(`Failed to load modules: ${moduleError.message}`);
 
-    const moduleIds = (modules ?? []).map((module) => module.id);
-    let chapters: Array<Record<string, unknown>> = [];
-
-    if (moduleIds.length > 0) {
+    const moduleIds = (modules ?? []).map((m) => m.id);
+    let lessons: Array<Record<string, unknown>> = [];
+    if (moduleIds.length) {
       const { data, error } = await supabase
-        .from("course_lesson")
-        .select("id,section_id,title,sort_order,content_id,content_status")
-        .in("section_id", moduleIds)
+        .from("lesson")
+        .select("slug,chapter_id,title,brief,sort_order,content_id")
+        .in("chapter_id", moduleIds)
         .order("sort_order", { ascending: true });
-
-      if (error) {
-        throw new Error(`Failed to load chapters: ${error.message}`);
-      }
-      chapters = data ?? [];
+      if (error) throw new Error(`Failed to load chapters: ${error.message}`);
+      lessons = data ?? [];
     }
 
-    const contentIds = chapters
-      .map((chapter) => chapter.content_id)
+    const contentIds = lessons
+      .map((lesson) => lesson.content_id)
       .filter((id): id is string => typeof id === "string" && id.length > 0);
 
     let contentRows: Array<Record<string, unknown>> = [];
-    if (contentIds.length > 0) {
+    if (contentIds.length) {
       const { data, error } = await supabase
-        .from("lesson_content")
-        .select("id,markdown,svg")
+        .from("content")
+        .select("id,title,section,markdown,svg,sources,updated_at")
         .in("id", contentIds);
-
-      if (error) {
-        throw new Error(`Failed to load content: ${error.message}`);
-      }
+      if (error) throw new Error(`Failed to load content: ${error.message}`);
       contentRows = data ?? [];
     }
 
     const contentById = new Map(contentRows.map((row) => [String(row.id), row]));
     const chaptersByModule = new Map<string, Array<Record<string, unknown>>>();
 
-    for (const chapter of chapters) {
-      const moduleId = String(chapter.section_id);
-      const content = chapter.content_id ? contentById.get(String(chapter.content_id)) : undefined;
-      const normalizedChapter = {
-        id: chapter.id,
-        title: chapter.title,
-        order: chapter.sort_order,
-        content_status: chapter.content_status,
+    for (const lesson of lessons) {
+      const content = lesson.content_id ? contentById.get(String(lesson.content_id)) : undefined;
+      const chapter = {
+        id: lesson.slug,
+        title: lesson.title,
+        brief: lesson.brief,
+        order: lesson.sort_order,
         content: content
           ? {
               id: content.id,
-              has_markdown: typeof content.markdown === "string" && content.markdown.length > 0,
-              has_svg: typeof content.svg === "string" && content.svg.length > 0,
+              title: content.title,
+              section: content.section,
+              markdown: content.markdown,
+              svg: content.svg,
+              sources: content.sources,
+              updated_at: content.updated_at,
             }
           : null,
       };
-
+      const moduleId = String(lesson.chapter_id);
       const list = chaptersByModule.get(moduleId) ?? [];
-      list.push(normalizedChapter);
+      list.push(chapter);
       chaptersByModule.set(moduleId, list);
     }
 
     const result = {
-      course: {
-        slug: course.slug,
-        title: course.title,
-        status: course.status,
-        source: course.source,
-      },
+      course,
       modules: (modules ?? []).map((module) => ({
         id: module.id,
         title: module.title,
-        description: module.blurb,
+        outcome: module.outcome,
+        week: module.week,
         order: module.sort_order,
         chapters: chaptersByModule.get(String(module.id)) ?? [],
       })),
     };
 
-    return {
-      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-    };
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+await server.connect(new StdioServerTransport());
