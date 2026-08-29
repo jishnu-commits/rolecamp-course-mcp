@@ -15,10 +15,10 @@ const errorText = (message: string, details?: unknown) => ({ isError: true, cont
 
 export function createRolecampMcpServer() {
   const supabase = getSupabase();
-  const server = new McpServer({ name: "rolecamp-course-mcp", version: "0.3.1" });
+  const server = new McpServer({ name: "rolecamp-course-mcp", version: "0.4.0" });
 
   server.registerTool("search_courses", { description: "Search RoleCamp courses by title, slug, or course type.", inputSchema: { query: z.string().min(1), source: z.string().optional() } }, async ({ query, source }) => {
-    let request = supabase.from("course").select("slug,title,source,status,difficulty,weeks,sessions").or(`title.ilike.%${query}%,slug.ilike.%${query}%`).order("sort_order");
+    let request = supabase.from("course").select("slug,title,source,status,course_type,difficulty,weeks,sessions").or(`title.ilike.%${query}%,slug.ilike.%${query}%`).order("sort_order");
     if (source) request = request.eq("source", source);
     const { data, error } = await request;
     if (error) throw new Error(`Failed to search courses: ${error.message}`);
@@ -26,7 +26,7 @@ export function createRolecampMcpServer() {
   });
 
   server.registerTool("get_course_structure", { description: "Read a RoleCamp course as Course -> Module -> Chapter -> Content. The physical DB schema is hidden from the caller.", inputSchema: { course_slug: z.string().min(1).describe("Course slug") } }, async ({ course_slug }) => {
-    const { data: course, error: courseError } = await supabase.from("course").select("id,slug,title,source,subtitle,description,status,difficulty,weeks,sessions,achievements,cover_image_url,sort_order,updated_at").eq("slug", course_slug).maybeSingle();
+    const { data: course, error: courseError } = await supabase.from("course").select("id,slug,title,source,subtitle,description,status,course_type,difficulty,weeks,sessions,achievements,cover_image_url,sort_order,updated_at").eq("slug", course_slug).maybeSingle();
     if (courseError) throw new Error(`Failed to load course: ${courseError.message}`);
     if (!course) return errorText("Course not found", { course_slug });
     const { data: modules, error: moduleError } = await supabase.from("chapter").select("id,title,week,outcome,sort_order").eq("course_slug", course_slug).order("sort_order");
@@ -47,11 +47,11 @@ export function createRolecampMcpServer() {
     return text({ course, modules: (modules ?? []).map(m => ({ id: m.id, title: m.title, outcome: m.outcome, week: m.week, order: m.sort_order, chapters: chaptersByModule.get(String(m.id)) ?? [] })) });
   });
 
-  server.registerTool("create_course", { description: "Create a new RoleCamp course record.", inputSchema: { slug: z.string().min(1), title: z.string().min(1), source: z.string().min(1), subtitle: z.string().min(1), description: z.string().min(1), status: z.string().default("draft"), difficulty: z.string().default("beginner"), weeks: z.number().int().nonnegative().default(0), sessions: z.number().int().nonnegative().default(0), sort_order: z.number().int().default(0) } }, async (input) => {
+  server.registerTool("create_course", { description: "Create a new RoleCamp course record.", inputSchema: { slug: z.string().min(1), title: z.string().min(1), source: z.string().min(1), subtitle: z.string().min(1), description: z.string().min(1), course_type: z.enum(["waypoint", "deeptrack"]), status: z.string().default("draft"), difficulty: z.string().default("beginner"), weeks: z.number().int().nonnegative().default(0), sessions: z.number().int().nonnegative().default(0), sort_order: z.number().int().default(0) } }, async (input) => {
     const { data: existing, error: lookupError } = await supabase.from("course").select("slug").eq("slug", input.slug).maybeSingle();
     if (lookupError) throw new Error(`Failed to check course: ${lookupError.message}`);
     if (existing) return errorText("Course slug already exists", { slug: input.slug });
-    const { data, error } = await supabase.from("course").insert({ ...input, achievements: [] }).select("slug,title,source,status").single();
+    const { data, error } = await supabase.from("course").insert({ ...input, achievements: [] }).select("slug,title,source,status,course_type").single();
     if (error) throw new Error(`Failed to create course: ${error.message}`);
     return text(data);
   });
