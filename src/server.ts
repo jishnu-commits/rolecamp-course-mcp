@@ -1,27 +1,23 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-if (!supabaseUrl || !supabaseServiceRoleKey) {
-  throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required");
+function getSupabase(): SupabaseClient {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in Vercel environment variables");
+  return createClient(url, key);
 }
-
-const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
 
 const text = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] });
 const errorText = (message: string, details?: unknown) => ({ isError: true, content: [{ type: "text" as const, text: JSON.stringify({ error: message, details }, null, 2) }] });
 
 export function createRolecampMcpServer() {
-  const server = new McpServer({ name: "rolecamp-course-mcp", version: "0.3.0" });
+  const supabase = getSupabase();
+  const server = new McpServer({ name: "rolecamp-course-mcp", version: "0.3.1" });
 
-  server.registerTool("search_courses", {
-    description: "Search RoleCamp courses by title, slug, or course type.",
-    inputSchema: { query: z.string().min(1), source: z.string().optional() },
-  }, async ({ query, source }) => {
+  server.registerTool("search_courses", { description: "Search RoleCamp courses by title, slug, or course type.", inputSchema: { query: z.string().min(1), source: z.string().optional() } }, async ({ query, source }) => {
     let request = supabase.from("course").select("slug,title,source,status,difficulty,weeks,sessions").or(`title.ilike.%${query}%,slug.ilike.%${query}%`).order("sort_order");
     if (source) request = request.eq("source", source);
     const { data, error } = await request;
@@ -29,48 +25,29 @@ export function createRolecampMcpServer() {
     return text(data ?? []);
   });
 
-  server.registerTool("get_course_structure", {
-    description: "Read a RoleCamp course as Course -> Module -> Chapter -> Content. The physical DB schema is hidden from the caller.",
-    inputSchema: { course_slug: z.string().min(1).describe("Course slug") },
-  }, async ({ course_slug }) => {
-    const { data: course, error: courseError } = await supabase.from("course").select("slug,title,source,subtitle,description,status,difficulty,weeks,sessions,achievements,cover_image_url,sort_order,updated_at").eq("slug", course_slug).maybeSingle();
+  server.registerTool("get_course_structure", { description: "Read a RoleCamp course as Course -> Module -> Chapter -> Content. The physical DB schema is hidden from the caller.", inputSchema: { course_slug: z.string().min(1).describe("Course slug") } }, async ({ course_slug }) => {
+    const { data: course, error: courseError } = await supabase.from("course").select("id,slug,title,source,subtitle,description,status,difficulty,weeks,sessions,achievements,cover_image_url,sort_order,updated_at").eq("slug", course_slug).maybeSingle();
     if (courseError) throw new Error(`Failed to load course: ${courseError.message}`);
     if (!course) return errorText("Course not found", { course_slug });
-
     const { data: modules, error: moduleError } = await supabase.from("chapter").select("id,title,week,outcome,sort_order").eq("course_slug", course_slug).order("sort_order");
     if (moduleError) throw new Error(`Failed to load modules: ${moduleError.message}`);
     const moduleIds = (modules ?? []).map(m => m.id);
-
-    let lessons: Array<Record<string, unknown>> = [];
-    if (moduleIds.length) {
-      const { data, error } = await supabase.from("lesson").select("slug,chapter_id,title,brief,tools,sort_order,content_id").in("chapter_id", moduleIds).order("sort_order");
-      if (error) throw new Error(`Failed to load chapters: ${error.message}`);
-      lessons = data ?? [];
-    }
-
-    const contentIds = lessons.map(l => l.content_id).filter((id): id is string => typeof id === "string" && id.length > 0);
-    let contents: Array<Record<string, unknown>> = [];
-    if (contentIds.length) {
-      const { data, error } = await supabase.from("content").select("id,title,section,markdown,svg,sources,updated_at").in("id", contentIds);
-      if (error) throw new Error(`Failed to load content: ${error.message}`);
-      contents = data ?? [];
-    }
-
-    const contentById = new Map(contents.map(c => [String(c.id), c]));
+    const { data: lessons, error: lessonError } = moduleIds.length ? await supabase.from("lesson").select("slug,chapter_id,title,brief,tools,sort_order,content_id").in("chapter_id", moduleIds).order("sort_order") : { data: [], error: null };
+    if (lessonError) throw new Error(`Failed to load chapters: ${lessonError.message}`);
+    const contentIds = (lessons ?? []).map(l => l.content_id).filter((id): id is string => typeof id === "string" && id.length > 0);
+    const { data: contents, error: contentError } = contentIds.length ? await supabase.from("content").select("id,title,section,markdown,svg,sources,updated_at").in("id", contentIds) : { data: [], error: null };
+    if (contentError) throw new Error(`Failed to load content: ${contentError.message}`);
+    const contentById = new Map((contents ?? []).map(c => [String(c.id), c]));
     const chaptersByModule = new Map<string, Array<Record<string, unknown>>>();
-    for (const lesson of lessons) {
+    for (const lesson of lessons ?? []) {
       const c = lesson.content_id ? contentById.get(String(lesson.content_id)) : undefined;
       const item = { id: lesson.slug, title: lesson.title, brief: lesson.brief, tools: lesson.tools, order: lesson.sort_order, content: c ? { id: c.id, title: c.title, section: c.section, markdown: c.markdown, svg: c.svg, sources: c.sources, updated_at: c.updated_at } : null };
-      const list = chaptersByModule.get(String(lesson.chapter_id)) ?? [];
-      list.push(item); chaptersByModule.set(String(lesson.chapter_id), list);
+      const list = chaptersByModule.get(String(lesson.chapter_id)) ?? []; list.push(item); chaptersByModule.set(String(lesson.chapter_id), list);
     }
     return text({ course, modules: (modules ?? []).map(m => ({ id: m.id, title: m.title, outcome: m.outcome, week: m.week, order: m.sort_order, chapters: chaptersByModule.get(String(m.id)) ?? [] })) });
   });
 
-  server.registerTool("create_course", {
-    description: "Create a new RoleCamp course record.",
-    inputSchema: { slug: z.string().min(1), title: z.string().min(1), source: z.string().min(1), subtitle: z.string().min(1), description: z.string().min(1), status: z.string().default("draft"), difficulty: z.string().default("beginner"), weeks: z.number().int().nonnegative().default(0), sessions: z.number().int().nonnegative().default(0), sort_order: z.number().int().default(0) },
-  }, async (input) => {
+  server.registerTool("create_course", { description: "Create a new RoleCamp course record.", inputSchema: { slug: z.string().min(1), title: z.string().min(1), source: z.string().min(1), subtitle: z.string().min(1), description: z.string().min(1), status: z.string().default("draft"), difficulty: z.string().default("beginner"), weeks: z.number().int().nonnegative().default(0), sessions: z.number().int().nonnegative().default(0), sort_order: z.number().int().default(0) } }, async (input) => {
     const { data: existing, error: lookupError } = await supabase.from("course").select("slug").eq("slug", input.slug).maybeSingle();
     if (lookupError) throw new Error(`Failed to check course: ${lookupError.message}`);
     if (existing) return errorText("Course slug already exists", { slug: input.slug });
@@ -79,10 +56,7 @@ export function createRolecampMcpServer() {
     return text(data);
   });
 
-  server.registerTool("create_module", {
-    description: "Create a Module. In the current DB this is stored as a chapter record.",
-    inputSchema: { course_slug: z.string().min(1), id: z.string().min(1), title: z.string().min(1), week: z.number().int().optional(), outcome: z.string().optional(), sort_order: z.number().int().default(0) },
-  }, async (input) => {
+  server.registerTool("create_module", { description: "Create a Module. In the current DB this is stored as a chapter record.", inputSchema: { course_slug: z.string().min(1), id: z.string().min(1), title: z.string().min(1), week: z.number().int().optional(), outcome: z.string().optional(), sort_order: z.number().int().default(0) } }, async (input) => {
     const { data: course } = await supabase.from("course").select("slug").eq("slug", input.course_slug).maybeSingle();
     if (!course) return errorText("Course not found", { course_slug: input.course_slug });
     const { data: existing } = await supabase.from("chapter").select("id").eq("id", input.id).maybeSingle();
@@ -92,10 +66,7 @@ export function createRolecampMcpServer() {
     return text(data);
   });
 
-  server.registerTool("create_chapter", {
-    description: "Create a Chapter under a Module. In the current DB this is stored as a lesson record.",
-    inputSchema: { slug: z.string().min(1), module_id: z.string().min(1), title: z.string().min(1), brief: z.string().optional(), tools: z.array(z.string()).default([]), sort_order: z.number().int().default(0), content_id: z.string().optional() },
-  }, async (input) => {
+  server.registerTool("create_chapter", { description: "Create a Chapter under a Module. In the current DB this is stored as a lesson record.", inputSchema: { slug: z.string().min(1), module_id: z.string().min(1), title: z.string().min(1), brief: z.string().optional(), tools: z.array(z.string()).default([]), sort_order: z.number().int().default(0), content_id: z.string().optional() } }, async (input) => {
     const { data: module } = await supabase.from("chapter").select("id").eq("id", input.module_id).maybeSingle();
     if (!module) return errorText("Module not found", { module_id: input.module_id });
     const { data: existing } = await supabase.from("lesson").select("slug").eq("slug", input.slug).maybeSingle();
@@ -105,10 +76,7 @@ export function createRolecampMcpServer() {
     return text(data);
   });
 
-  server.registerTool("create_content", {
-    description: "Create lesson content. SVG is optional but should be supplied when the content requires a diagram.",
-    inputSchema: { id: z.string().min(1), title: z.string().min(1), section: z.string().min(1), markdown: z.string().min(1), svg: z.string().optional(), sources: z.array(z.unknown()).default([]) },
-  }, async (input) => {
+  server.registerTool("create_content", { description: "Create lesson content. SVG is optional but should be supplied when the content requires a diagram.", inputSchema: { id: z.string().min(1), title: z.string().min(1), section: z.string().min(1), markdown: z.string().min(1), svg: z.string().optional(), sources: z.array(z.unknown()).default([]) } }, async (input) => {
     const { data: existing } = await supabase.from("content").select("id").eq("id", input.id).maybeSingle();
     if (existing) return errorText("Content id already exists", { id: input.id });
     const { data, error } = await supabase.from("content").insert({ ...input, svg: input.svg ?? null }).select("id,title,section,markdown,svg,sources,updated_at").single();
@@ -116,52 +84,22 @@ export function createRolecampMcpServer() {
     return text(data);
   });
 
-  server.registerTool("validate_course", {
-    description: "Validate a course before publishing. Checks hierarchy, required Markdown, and SVG on every content item.",
-    inputSchema: { course_slug: z.string().min(1) },
-  }, async ({ course_slug }) => {
-    const { data: course } = await supabase.from("course").select("slug,status").eq("slug", course_slug).maybeSingle();
-    if (!course) return errorText("Course not found", { course_slug });
-    const { data: modules, error: me } = await supabase.from("chapter").select("id,title").eq("course_slug", course_slug);
-    if (me) throw new Error(me.message);
-    const ids = (modules ?? []).map(m => m.id);
-    const { data: lessons, error: le } = ids.length ? await supabase.from("lesson").select("slug,chapter_id,title,content_id").in("chapter_id", ids) : { data: [], error: null };
-    if (le) throw new Error(le.message);
-    const contentIds = (lessons ?? []).map(l => l.content_id).filter((x): x is string => typeof x === "string" && x.length > 0);
-    const { data: contents, error: ce } = contentIds.length ? await supabase.from("content").select("id,markdown,svg").in("id", contentIds) : { data: [], error: null };
-    if (ce) throw new Error(ce.message);
-    const contentMap = new Map((contents ?? []).map(c => [c.id, c]));
-    const issues: string[] = [];
-    if (!modules?.length) issues.push("Course has no modules");
-    for (const m of modules ?? []) {
-      const ms = (lessons ?? []).filter(l => l.chapter_id === m.id);
-      if (!ms.length) issues.push(`Module has no chapters: ${m.title}`);
-      for (const l of ms) {
-        if (!l.content_id) { issues.push(`Chapter has no content: ${l.title}`); continue; }
-        const c = contentMap.get(l.content_id);
-        if (!c) { issues.push(`Missing content record: ${l.title}`); continue; }
-        if (!c.markdown?.trim()) issues.push(`Empty markdown: ${l.title}`);
-        if (!c.svg?.trim()) issues.push(`Missing SVG: ${l.title}`);
-      }
-    }
-    return text({ valid: issues.length === 0, course_slug, modules: modules?.length ?? 0, chapters: lessons?.length ?? 0, content: contents?.length ?? 0, issues });
+  server.registerTool("validate_course", { description: "Validate a course before publishing. Checks hierarchy, required Markdown, and SVG on every content item.", inputSchema: { course_slug: z.string().min(1) } }, async ({ course_slug }) => {
+    const result = await validateForPublish(supabase, course_slug);
+    return text({ course_slug, ...result });
   });
 
-  server.registerTool("publish_course", {
-    description: "Publish a validated course by setting status to published.",
-    inputSchema: { course_slug: z.string().min(1) },
-  }, async ({ course_slug }) => {
-    const validation = await validateForPublish(course_slug);
+  server.registerTool("publish_course", { description: "Publish a validated course by setting status to published.", inputSchema: { course_slug: z.string().min(1) } }, async ({ course_slug }) => {
+    const validation = await validateForPublish(supabase, course_slug);
     if (!validation.valid) return errorText("Course failed validation; not published", validation);
     const { data, error } = await supabase.from("course").update({ status: "published" }).eq("slug", course_slug).select("slug,title,status,updated_at").single();
     if (error) throw new Error(`Failed to publish course: ${error.message}`);
     return text(data);
   });
-
   return server;
 }
 
-async function validateForPublish(course_slug: string): Promise<{ valid: boolean; issues: string[] }> {
+async function validateForPublish(supabase: SupabaseClient, course_slug: string): Promise<{ valid: boolean; modules: number; chapters: number; content: number; issues: string[] }> {
   const { data: modules } = await supabase.from("chapter").select("id,title").eq("course_slug", course_slug);
   const ids = (modules ?? []).map(m => m.id);
   const { data: lessons } = ids.length ? await supabase.from("lesson").select("slug,chapter_id,title,content_id").in("chapter_id", ids) : { data: [] };
@@ -179,14 +117,8 @@ async function validateForPublish(course_slug: string): Promise<{ valid: boolean
       else { if (!c.markdown?.trim()) issues.push(`Empty markdown: ${l.title}`); if (!c.svg?.trim()) issues.push(`Missing SVG: ${l.title}`); }
     }
   }
-  return { valid: issues.length === 0, issues };
+  return { valid: issues.length === 0, modules: modules?.length ?? 0, chapters: lessons?.length ?? 0, content: contents?.length ?? 0, issues };
 }
 
-export async function runStdioServer() {
-  const server = createRolecampMcpServer();
-  await server.connect(new StdioServerTransport());
-}
-
-if (process.argv[1]?.endsWith("server.ts")) {
-  await runStdioServer();
-}
+export async function runStdioServer() { const server = createRolecampMcpServer(); await server.connect(new StdioServerTransport()); }
+if (process.argv[1]?.endsWith("server.ts")) await runStdioServer();
