@@ -47,7 +47,7 @@ export function createRolecampMcpServer() {
     return text({ course, modules: (modules ?? []).map(m => ({ id: m.id, title: m.title, outcome: m.outcome, week: m.week, order: m.sort_order, chapters: chaptersByModule.get(String(m.id)) ?? [] })) });
   });
 
-  server.registerTool("create_course", { description: "Create a new RoleCamp course record.", inputSchema: { slug: z.string().min(1), title: z.string().min(1), source: z.string().min(1), subtitle: z.string().min(1), description: z.string().min(1), course_type: z.enum(["waypoint", "deeptrack"]), status: z.string().default("draft"), difficulty: z.string().default("beginner"), weeks: z.number().int().nonnegative().default(0), sessions: z.number().int().nonnegative().default(0), sort_order: z.number().int().default(0) } }, async (input) => {
+  server.registerTool("create_course", { description: "Create a new RoleCamp course record. New courses start as coming-soon (draft); use publish_course to make them live.", inputSchema: { slug: z.string().min(1), title: z.string().min(1), source: z.string().min(1), subtitle: z.string().min(1), description: z.string().min(1), course_type: z.enum(["waypoint", "deeptrack"]), status: z.enum(["live", "coming-soon"]).default("coming-soon"), difficulty: z.string().default("beginner"), weeks: z.number().int().nonnegative().default(0), sessions: z.number().int().nonnegative().default(0), sort_order: z.number().int().default(0) } }, async (input) => {
     const { data: existing, error: lookupError } = await supabase.from("course").select("slug").eq("slug", input.slug).maybeSingle();
     if (lookupError) throw new Error(`Failed to check course: ${lookupError.message}`);
     if (existing) return errorText("Course slug already exists", { slug: input.slug });
@@ -89,10 +89,10 @@ export function createRolecampMcpServer() {
     return text({ course_slug, ...result });
   });
 
-  server.registerTool("publish_course", { description: "Publish a validated course by setting status to published.", inputSchema: { course_slug: z.string().min(1) } }, async ({ course_slug }) => {
+  server.registerTool("publish_course", { description: "Publish a validated course by setting status to live.", inputSchema: { course_slug: z.string().min(1) } }, async ({ course_slug }) => {
     const validation = await validateForPublish(supabase, course_slug);
     if (!validation.valid) return errorText("Course failed validation; not published", validation);
-    const { data, error } = await supabase.from("course").update({ status: "published" }).eq("slug", course_slug).select("slug,title,status,updated_at").single();
+    const { data, error } = await supabase.from("course").update({ status: "live" }).eq("slug", course_slug).select("slug,title,status,updated_at").single();
     if (error) throw new Error(`Failed to publish course: ${error.message}`);
     return text(data);
   });
