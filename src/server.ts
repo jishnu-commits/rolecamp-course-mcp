@@ -15,18 +15,19 @@ const errorText = (message: string, details?: unknown) => ({ isError: true, cont
 
 export function createRolecampMcpServer() {
   const supabase = getSupabase();
-  const server = new McpServer({ name: "rolecamp-course-mcp", version: "0.4.0" });
+  const server = new McpServer({ name: "rolecamp-course-mcp", version: "0.5.0" });
 
-  server.registerTool("search_courses", { description: "Search RoleCamp courses by title, slug, or course type.", inputSchema: { query: z.string().min(1), source: z.string().optional() } }, async ({ query, source }) => {
-    let request = supabase.from("course").select("slug,title,source,status,course_type,difficulty,weeks,sessions").or(`title.ilike.%${query}%,slug.ilike.%${query}%`).order("sort_order");
+  server.registerTool("search_courses", { description: "Search RoleCamp courses by title, slug, or course type. Optionally filter by teaching language.", inputSchema: { query: z.string().min(1), source: z.string().optional(), language: z.enum(["en", "ml"]).optional().describe("Only courses taught in this language: en (English) or ml (Malayalam)") } }, async ({ query, source, language }) => {
+    let request = supabase.from("course").select("slug,title,source,status,course_type,language,difficulty,weeks,sessions").or(`title.ilike.%${query}%,slug.ilike.%${query}%`).order("sort_order");
     if (source) request = request.eq("source", source);
+    if (language) request = request.eq("language", language);
     const { data, error } = await request;
     if (error) throw new Error(`Failed to search courses: ${error.message}`);
     return text(data ?? []);
   });
 
   server.registerTool("get_course_structure", { description: "Read a RoleCamp course as Course -> Module -> Chapter -> Content. The physical DB schema is hidden from the caller.", inputSchema: { course_slug: z.string().min(1).describe("Course slug") } }, async ({ course_slug }) => {
-    const { data: course, error: courseError } = await supabase.from("course").select("id,slug,title,source,subtitle,description,status,course_type,difficulty,weeks,sessions,achievements,cover_image_url,sort_order,updated_at").eq("slug", course_slug).maybeSingle();
+    const { data: course, error: courseError } = await supabase.from("course").select("id,slug,title,source,subtitle,description,status,course_type,language,difficulty,weeks,sessions,achievements,cover_image_url,sort_order,updated_at").eq("slug", course_slug).maybeSingle();
     if (courseError) throw new Error(`Failed to load course: ${courseError.message}`);
     if (!course) return errorText("Course not found", { course_slug });
     const { data: modules, error: moduleError } = await supabase.from("chapter").select("id,title,week,outcome,sort_order").eq("course_slug", course_slug).order("sort_order");
@@ -47,11 +48,11 @@ export function createRolecampMcpServer() {
     return text({ course, modules: (modules ?? []).map(m => ({ id: m.id, title: m.title, outcome: m.outcome, week: m.week, order: m.sort_order, chapters: chaptersByModule.get(String(m.id)) ?? [] })) });
   });
 
-  server.registerTool("create_course", { description: "Create a new RoleCamp course record. New courses start as coming-soon (draft); use publish_course to make them live.", inputSchema: { slug: z.string().min(1), title: z.string().min(1), source: z.string().min(1), subtitle: z.string().min(1), description: z.string().min(1), course_type: z.enum(["waypoint", "deeptrack"]), status: z.enum(["live", "coming-soon"]).default("coming-soon"), difficulty: z.string().default("beginner"), weeks: z.number().int().nonnegative().default(0), sessions: z.number().int().nonnegative().default(0), sort_order: z.number().int().default(0) } }, async (input) => {
+  server.registerTool("create_course", { description: "Create a new RoleCamp course record. New courses start as coming-soon (draft); use publish_course to make them live. Each teaching language is its own course: create one per language (e.g. ai-mastery-en and ai-mastery-ml) with the same title, and the site links them as each other's other-language version. A course with no language is hidden from the site.", inputSchema: { slug: z.string().min(1), title: z.string().min(1), source: z.string().min(1), subtitle: z.string().min(1), description: z.string().min(1), course_type: z.enum(["waypoint", "deeptrack"]), language: z.enum(["en", "ml"]).describe("Teaching language: en (English) or ml (Malayalam)"), status: z.enum(["live", "coming-soon"]).default("coming-soon"), difficulty: z.string().default("beginner"), weeks: z.number().int().nonnegative().default(0), sessions: z.number().int().nonnegative().default(0), sort_order: z.number().int().default(0) } }, async (input) => {
     const { data: existing, error: lookupError } = await supabase.from("course").select("slug").eq("slug", input.slug).maybeSingle();
     if (lookupError) throw new Error(`Failed to check course: ${lookupError.message}`);
     if (existing) return errorText("Course slug already exists", { slug: input.slug });
-    const { data, error } = await supabase.from("course").insert({ ...input, achievements: [] }).select("slug,title,source,status,course_type").single();
+    const { data, error } = await supabase.from("course").insert({ ...input, achievements: [] }).select("slug,title,source,status,course_type,language").single();
     if (error) throw new Error(`Failed to create course: ${error.message}`);
     return text(data);
   });
@@ -84,6 +85,13 @@ export function createRolecampMcpServer() {
     return text(data);
   });
 
+  server.registerTool("set_course_language", { description: "Set or clear the teaching language of an existing course. en = English, ml = Malayalam, null = no language (the course is hidden from the site).", inputSchema: { course_slug: z.string().min(1), language: z.enum(["en", "ml"]).nullable() } }, async ({ course_slug, language }) => {
+    const { data, error } = await supabase.from("course").update({ language, updated_at: new Date().toISOString() }).eq("slug", course_slug).select("slug,title,status,language").maybeSingle();
+    if (error) throw new Error(`Failed to set course language: ${error.message}`);
+    if (!data) return errorText("Course not found", { course_slug });
+    return text(data);
+  });
+
   server.registerTool("validate_course", { description: "Validate a course before publishing. Checks hierarchy, required Markdown, and SVG on every content item.", inputSchema: { course_slug: z.string().min(1) } }, async ({ course_slug }) => {
     const result = await validateForPublish(supabase, course_slug);
     return text({ course_slug, ...result });
@@ -92,7 +100,12 @@ export function createRolecampMcpServer() {
   server.registerTool("publish_course", { description: "Publish a validated course by setting status to live.", inputSchema: { course_slug: z.string().min(1) } }, async ({ course_slug }) => {
     const validation = await validateForPublish(supabase, course_slug);
     if (!validation.valid) return errorText("Course failed validation; not published", validation);
-    const { data, error } = await supabase.from("course").update({ status: "live" }).eq("slug", course_slug).select("slug,title,status,updated_at").single();
+    // A live course with no language never shows on the site, so publishing
+    // one is almost always a mistake. Set it first with set_course_language.
+    const { data: current, error: langError } = await supabase.from("course").select("language").eq("slug", course_slug).maybeSingle();
+    if (langError) throw new Error(`Failed to read course language: ${langError.message}`);
+    if (!current?.language) return errorText("Course has no teaching language; not published. Set it with set_course_language (en or ml) first.", { course_slug });
+    const { data, error } = await supabase.from("course").update({ status: "live" }).eq("slug", course_slug).select("slug,title,status,language,updated_at").single();
     if (error) throw new Error(`Failed to publish course: ${error.message}`);
     return text(data);
   });
