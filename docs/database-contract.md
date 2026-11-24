@@ -95,6 +95,7 @@ Initial tools:
 
 ### Update
 
+- `set_course_language` (live)
 - `update_course`
 - `update_module`
 - `update_chapter`
@@ -106,6 +107,14 @@ Initial tools:
 - `publish_course`
 
 `publish_course` must be explicit; generation should default to draft state.
+
+## Course language
+
+`course.language` (text, nullable) is the teaching language: `en` (English) or `ml` (Malayalam). It was added by the RoleCamp app's migration `0021_course_language`.
+
+- Each language is its own course row with its own slug, sessions and progress, e.g. `ai-mastery-en` and `ai-mastery-ml`. Give both the same `title`: the site pairs them by title for its "Also taught in" link.
+- A course with `language` NULL is treated as an older course and is hidden from the site, even when `status` is `live`.
+- `create_course` requires `language`; `set_course_language` changes it; `publish_course` refuses a course without one; `search_courses` can filter by it.
 
 ## Security
 
